@@ -32,51 +32,107 @@ using std::endl;
 static const size_t MAX_BYTES = 256 * 1024;  //256kb
 static const size_t NFREELISTS = 208;
 static const size_t NPAGES = 129;
-static const size_t PAGE_SHIFT = 12;
+static const size_t PAGE_SHIFT = 13;
 
+//WIN32配置 有_WIN32，没有_WIN64
+//WIN64配置 有_WIN32，有_WIN64
+//所以_WIN64判断放在前面
 #ifdef _WIN64
 	typedef unsigned long long PAGE_ID;
 #elif _WIN32
 	typedef size_t PAGE_ID;
 #else
-	//linux
+	#if defined(__x86_64__) || defined(__aarch64__)  // 64 位架构检测
+		typedef unsigned long long PAGE_ID;          // 64 位系统使用 8 字节类型
+	#elif defined(__i386__) || defined(__arm__)       // 32 位架构检测
+		typedef size_t PAGE_ID;                      // 32 位系统使用 size_t（4 字节）
+	#else
+		#error "Unsupported platform or architecture!"  // 不支持的平台触发编译错误
+	#endif
 #endif 
-//WIN32配置 有_WIN32，没有_WIN64
-//WIN64配置 有_WIN32，有_WIN64
-//所以_WIN64判断放在前面
+
 
 #ifdef _WIN32
-#include<windows.h>
+	#include<windows.h>
 #else
 	//linux下brk mmap等的头文件
+	#include <sys/mman.h>  // mmap, munmap
+	#include <unistd.h>     // sysconf(_SC_PAGESIZE)
+	//  Linux 下调用 munmap(ptr, page_size) 必须知道分配大小！否则只能单页释放
+	// 全局映射表记录分配大小（指针 -> 页数）
+	static std::unordered_map<void*, size_t> s_allocationMap;
+	static std::mutex s_mutex;  // 保护映射表的互斥锁
 #endif
+
 //直接去堆上按页申请空间，脱离malloc
 inline static void* SystemAlloc(size_t kpage)//页数 
 {
+	if (kpage == 0) return nullptr;
 #ifdef _WIN32
-	void* ptr = VirtualAlloc(nullptr, kpage * (1 << PAGE_SHIFT), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 	//参数：
 	//1.分配内存区域的地址,设nullptr表示由系统决定
 	//2.要分配或者保留的区域的大小，以字节为单位  
 	//3.分配类型
 	//4.被分配区域的访问保护方式
+	void* ptr = VirtualAlloc(nullptr, kpage << PAGE_SHIFT, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 #else
-	// linux下brk、mmap等
+	// Linux 使用 mmap
+	//size_t page_size = sysconf(_SC_PAGESIZE); // 获取系统页大小
+	//size_t total_size = kpage * page_size;
+	size_t total_size = kpage << PAGE_SHIFT;
+	void* ptr = mmap(
+		nullptr,
+		total_size,
+		PROT_READ | PROT_WRITE,              // 读写权限
+		MAP_PRIVATE | MAP_ANONYMOUS,          // 私有匿名映射（不关联文件）
+		-1, 0
+	);
 #endif
-	if (ptr == nullptr)
+	// 统一错误处理
+	bool failed =
+#ifdef _WIN32
+	(ptr == nullptr);
+#else
+	(ptr == MAP_FAILED);
+#endif
+	if (failed) 
+	{
+		std::cerr << "SystemAlloc failed for " << kpage << " pages\n";
 		throw std::bad_alloc();
+	}
+#ifndef _WIN32
+	{
+		std::lock_guard<std::mutex> lock(s_mutex);
+		s_allocationMap[ptr] = kpage;
+	}
+#endif
 	return ptr;
 }
+
 //将内存直接归还给堆，脱离free
 inline static void SystemFree(void* ptr)
 {
+	if (!ptr) return;
 #ifdef _WIN32
 	VirtualFree(ptr, 0, MEM_RELEASE);
 #else
 	// sbrk unmmap等
+	size_t kpage = 0;
+	{
+		std::lock_guard<std::mutex> lock(s_mutex);
+		auto it = s_allocationMap.find(ptr);
+		if (it == s_allocationMap.end()) {
+			std::cerr << "SystemFree error: Unknown pointer " << ptr << "\n";
+			return;  // 避免重复释放或无效指针
+		}
+		kpage = it->second;
+		s_allocationMap.erase(it);
+	}
+	size_t total_size = kpage << PAGE_SHIFT;
+	if (munmap(ptr, total_size) == -1) 
+		std::cerr << "SystemFree(munmap) failed for " << ptr << "\n";
 #endif
 }
-
 
 
 static void*& NextObj(void* obj)
@@ -185,30 +241,13 @@ public:
 	// 计算对齐后的大小
 	static inline size_t RoundUp(size_t bytes)
 	{
-		if (bytes <= 128)
-		{
-			return _RoundUp(bytes, 8);
-		}
-		else if (bytes <= 1024)
-		{
-			return _RoundUp(bytes, 16);
-		}
-		else if (bytes <= 8 * 1024)
-		{
-			return _RoundUp(bytes, 128);
-		}
-		else if (bytes <= 64 * 1024)
-		{
-			return _RoundUp(bytes, 1024);
-		}
-		else if (bytes <= 256 * 1024)
-		{
-			return _RoundUp(bytes, 8 * 1024);
-		}
-		else//大于256k
-		{
-			return _RoundUp(bytes, 1 << PAGE_SHIFT);//以一页对齐
-		}
+		if (bytes <= 128) return _RoundUp(bytes, 8);
+		else if (bytes <= 1024) return _RoundUp(bytes, 16);
+		else if (bytes <= 8 * 1024) return _RoundUp(bytes, 128);
+		else if (bytes <= 64 * 1024) return _RoundUp(bytes, 1024);
+		else if (bytes <= 256 * 1024) return _RoundUp(bytes, 8 * 1024);
+		//大于256k
+		else return _RoundUp(bytes, 1 << PAGE_SHIFT);//以一页对齐
 	}
 
 
