@@ -17,4 +17,4 @@ private:
 };
 
 //线程局部存储 TLS
-static __declspec(thread) ThreadCache* pTLSThreadCache = nullptr;
+static thread_local ThreadCache* pTLSThreadCache = nullptr;
