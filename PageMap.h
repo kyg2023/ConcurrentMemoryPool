@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include"Common.h"
 #include"ObjectPool.h"
 
@@ -75,7 +76,7 @@ public:
 	void set(Number k, void* v) {
 		const Number i1 = k >> LEAF_BITS;
 		const Number i2 = k & (LEAF_LENGTH - 1);
-		ASSERT(i1 < ROOT_LENGTH);
+		assert(i1 < ROOT_LENGTH);
 		root_[i1]->values[i2] = v;
 	}
 	bool Ensure(Number start, size_t n) {
@@ -152,7 +153,7 @@ public:
 		return reinterpret_cast<Leaf*>(root_->ptrs[i1]->ptrs[i2])->values[i3];
 	}
 	void set(Number k, void* v) {
-		ASSERT(k >> BITS == 0);
+		assert(k >> BITS == 0);
 		const Number i1 = k >> (LEAF_BITS + INTERIOR_BITS);
 		const Number i2 = (k >> LEAF_BITS) & (INTERIOR_LENGTH - 1);
 		const Number i3 = k & (LEAF_LENGTH - 1);
